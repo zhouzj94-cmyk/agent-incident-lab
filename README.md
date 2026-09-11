@@ -3,6 +3,8 @@
 **Tool-driven Incident Investigation Agent**  
 *Evaluating and improving small-model agents for evidence-driven system diagnosis*
 
+[中文文档](README.zh-CN.md)
+
 ## Overview
 
 This project builds a lightweight long-horizon incident investigation agent on **Qwen2.5-7B**, using public system-log datasets, tool-driven investigation, verification, and trajectory evaluation.

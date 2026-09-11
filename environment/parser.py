@@ -6,9 +6,20 @@ from agent.state import LogEntry
 
 
 class BGLDatasetLoader:
+    """
+    BGL 数据集加载器。
+    
+    BGL 日志格式（空格分隔）：
+    label timestamp node day time node_id severity event_id message...
+    
+    标签说明：
+    - "-" 表示正常日志
+    - 其他值表示异常类型（如 "IF", "NF" 等）
+    """
+    
     def __init__(self, data_path: str | Path):
         self.data_path = Path(data_path)
-        self._df: pd.DataFrame | None = None
+        self._df: pd.DataFrame | None = None  # 懒加载缓存
 
     def load(self) -> pd.DataFrame:
         if self._df is not None:

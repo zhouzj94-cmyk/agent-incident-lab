@@ -10,6 +10,15 @@ from tools.registry import ToolRegistry, ToolResult
 
 
 class InvestigationController:
+    """
+    核心调查控制器，实现多步骤事件调查循环。
+    
+    设计原则：
+    - Agent 负责决策和推理，工具负责数据处理
+    - 通过假设驱动的方式进行调查
+    - 支持重新规划（re-plan）以应对调查停滞
+    """
+    
     def __init__(
         self,
         llm: OllamaProvider,
@@ -21,15 +30,26 @@ class InvestigationController:
     ):
         self.llm = llm
         self.tools = tools
-        self.max_steps = max_steps
-        self.max_replans = max_replans
+        self.max_steps = max_steps  # 防止无限循环
+        self.max_replans = max_replans  # 重新规划次数限制
         self.max_retries = max_retries
-        self.confidence_threshold = confidence_threshold
+        self.confidence_threshold = confidence_threshold  # 置信度阈值，达到后可结束调查
 
         self.state: InvestigationState | None = None
-        self.trajectory: list[dict] = []
+        self.trajectory: list[dict] = []  # 记录完整调查轨迹，用于后续评估
 
     async def investigate(self, incident: Incident) -> dict:
+        """
+        执行完整的调查流程。
+        
+        调查循环：
+        1. 加载事件信息
+        2. 规划调查步骤
+        3. 选择并执行工具
+        4. 观察结果并更新假设
+        5. 验证是否需要重新规划
+        6. 重复直到达到结束条件
+        """
         self.state = self._init_state(incident)
         self.trajectory = []
 
@@ -37,26 +57,32 @@ class InvestigationController:
         while step < self.max_steps:
             step += 1
 
+            # 让 LLM 决定下一步行动
             action = await self._decide_action()
 
+            # 如果 LLM 决定结束调查，跳出循环
             if action["type"] == "finish":
                 break
 
+            # 执行工具调用并更新状态
             if action["type"] == "tool_call":
                 result = await self._execute_tool(action)
                 self._update_state(result)
 
+                # 检查是否需要重新规划（调查停滞时触发）
                 should_replan = self._check_replan_condition()
                 if should_replan and self.state["replan_count"] < self.max_replans:
                     await self._replan()
                     self.state["replan_count"] += 1
 
+            # 记录当前步骤到轨迹
             self.trajectory.append({
                 "step": step,
                 "action": action,
                 "state_snapshot": self._snapshot_state(),
             })
 
+        # 生成最终调查报告
         final_answer = await self._generate_final_answer()
         self.state["final_answer"] = final_answer
 
@@ -97,14 +123,23 @@ class InvestigationController:
         return action
 
     def _parse_action(self, response: str) -> dict:
+        """
+        解析 LLM 响应，提取要执行的动作。
+        
+        当前实现：基于关键词匹配（简单但有效）
+        未来可升级为：结构化输出或工具调用 API
+        """
         response_lower = response.lower()
 
+        # 检查是否决定结束调查
         if "finish_investigation" in response_lower or "conclude" in response_lower:
             return {
                 "type": "finish",
                 "reasoning": response,
             }
 
+        # 工具关键词映射表
+        # 优先级：按顺序匹配，第一个匹配的工具会被选中
         tool_keywords = {
             "search_logs": ["search", "find", "query", "logs"],
             "get_error_stats": ["error", "stats", "statistics", "count"],
@@ -126,6 +161,7 @@ class InvestigationController:
                     },
                 }
 
+        # 默认行为：如果无法解析，结束调查
         return {
             "type": "finish",
             "reasoning": response,

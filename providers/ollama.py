@@ -16,9 +16,18 @@ class LLMProvider(ABC):
 
 
 class OllamaProvider(LLMProvider):
+    """
+    Ollama LLM 提供者，通过 HTTP API 与本地 Ollama 服务通信。
+    
+    注意：
+    - trust_env=False 是必需的，防止 Windows 系统代理设置干扰 localhost 连接
+    - 超时设置为 300 秒，因为 7B 模型生成调查响应可能需要较长时间
+    """
+    
     def __init__(self, base_url: str = "http://localhost:11434", model: str = "qwen2.5:7b"):
         self.base_url = base_url
         self.model = model
+        # trust_env=False 防止 httpx 读取系统代理设置（Windows 上会导致 "Relay failed" 错误）
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=10.0),
             trust_env=False,
