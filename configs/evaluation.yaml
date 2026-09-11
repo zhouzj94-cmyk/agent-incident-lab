@@ -1,0 +1,20 @@
+evaluation:
+  metrics:
+    - root_cause_accuracy
+    - evidence_precision
+    - tool_selection_accuracy
+    - investigation_success_rate
+    - average_steps
+    - redundant_tool_calls
+    - recovery_rate
+    - replan_success_rate
+
+  baselines:
+    - direct_llm
+    - tool_agent
+    - tool_verifier
+    - full_agent
+
+  output:
+    format: [json, csv]
+    directory: reports/

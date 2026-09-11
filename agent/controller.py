@@ -1,0 +1,250 @@
+import asyncio
+from typing import Any
+from datetime import datetime
+
+from agent.state import Incident, Hypothesis, Evidence
+from agent.context import InvestigationState
+from agent.prompts.system import SYSTEM_PROMPT, INCIDENT_PROMPT_TEMPLATE
+from providers.ollama import OllamaProvider
+from tools.registry import ToolRegistry, ToolResult
+
+
+class InvestigationController:
+    def __init__(
+        self,
+        llm: OllamaProvider,
+        tools: ToolRegistry,
+        max_steps: int = 12,
+        max_replans: int = 3,
+        max_retries: int = 2,
+        confidence_threshold: float = 0.75,
+    ):
+        self.llm = llm
+        self.tools = tools
+        self.max_steps = max_steps
+        self.max_replans = max_replans
+        self.max_retries = max_retries
+        self.confidence_threshold = confidence_threshold
+
+        self.state: InvestigationState | None = None
+        self.trajectory: list[dict] = []
+
+    async def investigate(self, incident: Incident) -> dict:
+        self.state = self._init_state(incident)
+        self.trajectory = []
+
+        step = 0
+        while step < self.max_steps:
+            step += 1
+
+            action = await self._decide_action()
+
+            if action["type"] == "finish":
+                break
+
+            if action["type"] == "tool_call":
+                result = await self._execute_tool(action)
+                self._update_state(result)
+
+                should_replan = self._check_replan_condition()
+                if should_replan and self.state["replan_count"] < self.max_replans:
+                    await self._replan()
+                    self.state["replan_count"] += 1
+
+            self.trajectory.append({
+                "step": step,
+                "action": action,
+                "state_snapshot": self._snapshot_state(),
+            })
+
+        final_answer = await self._generate_final_answer()
+        self.state["final_answer"] = final_answer
+
+        return {
+            "incident_id": incident.incident_id,
+            "trajectory": self.trajectory,
+            "final_answer": final_answer,
+            "steps": step,
+        }
+
+    def _init_state(self, incident: Incident) -> InvestigationState:
+        return {
+            "incident_id": incident.incident_id,
+            "user_goal": f"Investigate incident {incident.incident_id}",
+            "current_time_window": {
+                "start": incident.start_time.isoformat(),
+                "end": incident.end_time.isoformat(),
+            },
+            "observations": [],
+            "hypotheses": [],
+            "evidence": [],
+            "available_tools": [t.name for t in self.tools.list_tools()],
+            "plan": ["search_logs", "get_error_stats"],
+            "completed_steps": [],
+            "confidence": 0.0,
+            "retry_count": 0,
+            "replan_count": 0,
+            "verification_result": {},
+            "final_answer": {},
+        }
+
+    async def _decide_action(self) -> dict:
+        prompt = self._build_prompt()
+
+        response = await self.llm.generate(prompt)
+
+        action = self._parse_action(response)
+        return action
+
+    def _parse_action(self, response: str) -> dict:
+        response_lower = response.lower()
+
+        if "finish_investigation" in response_lower or "conclude" in response_lower:
+            return {
+                "type": "finish",
+                "reasoning": response,
+            }
+
+        tool_keywords = {
+            "search_logs": ["search", "find", "query", "logs"],
+            "get_error_stats": ["error", "stats", "statistics", "count"],
+            "compare_window": ["compare", "baseline", "window"],
+            "get_related_events": ["related", "trace", "pattern"],
+            "get_service_summary": ["service", "node", "summary"],
+            "verify_hypothesis": ["verify", "hypothesis", "check"],
+        }
+
+        for tool_name, keywords in tool_keywords.items():
+            if any(kw in response_lower for kw in keywords):
+                time_window = self.state["current_time_window"]
+                return {
+                    "type": "tool_call",
+                    "tool_name": tool_name,
+                    "tool_args": {
+                        "start_time": time_window["start"],
+                        "end_time": time_window["end"],
+                    },
+                }
+
+        return {
+            "type": "finish",
+            "reasoning": response,
+        }
+
+    def _build_prompt(self) -> str:
+        incident_id = self.state["incident_id"]
+        time_window = self.state["current_time_window"]
+
+        context = f"""
+Current Investigation State:
+- Step {len(self.state['completed_steps']) + 1}
+- Confidence: {self.state['confidence']:.2f}
+- Hypotheses: {len(self.state['hypotheses'])}
+- Evidence collected: {len(self.state['evidence'])}
+
+Recent observations:
+"""
+        for obs in self.state["observations"][-3:]:
+            context += f"- {obs}\n"
+
+        if self.state["hypotheses"]:
+            context += "\nActive hypotheses:\n"
+            for h in self.state["hypotheses"][-2:]:
+                context += f"- {h.statement} (confidence: {h.confidence:.2f})\n"
+
+        prompt = INCIDENT_PROMPT_TEMPLATE.format(
+            incident_id=incident_id,
+            start_time=time_window["start"],
+            end_time=time_window["end"],
+            alert="Anomalous activity detected",
+        )
+
+        return f"{SYSTEM_PROMPT}\n\n{prompt}\n\n{context}"
+
+    async def _execute_tool(self, action: dict) -> ToolResult:
+        tool_name = action["tool_name"]
+        tool_args = action["tool_args"]
+
+        result = await self.tools.execute(tool_name, **tool_args)
+        return result
+
+    def _update_state(self, result: ToolResult) -> None:
+        self.state["completed_steps"].append({
+            "tool": result.tool,
+            "status": result.status,
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        observation = f"Called {result.tool}: {result.status}"
+        self.state["observations"].append(observation)
+
+        if result.evidence_ids:
+            for eid in result.evidence_ids:
+                evidence = Evidence(
+                    evidence_id=eid,
+                    source=result.tool,
+                    content=str(result.result),
+                )
+                self.state["evidence"].append(evidence)
+
+    def _check_replan_condition(self) -> bool:
+        if len(self.state["completed_steps"]) < 2:
+            return False
+
+        last_two = self.state["completed_steps"][-2:]
+        if all(step["status"] == "error" for step in last_two):
+            return True
+
+        if len(self.state["observations"]) >= 2:
+            last_two_obs = self.state["observations"][-2:]
+            if last_two_obs[0] == last_two_obs[1]:
+                return True
+
+        return False
+
+    async def _replan(self) -> None:
+        prompt = f"""
+Investigation is not progressing effectively.
+
+Current state:
+- Steps completed: {len(self.state['completed_steps'])}
+- Evidence: {len(self.state['evidence'])}
+- Confidence: {self.state['confidence']:.2f}
+
+Generate a new investigation plan using different tools or approaches.
+
+Available tools: {', '.join(self.state['available_tools'])}
+"""
+
+        response = await self.llm.generate(prompt)
+
+        self.state["plan"] = ["search_logs", "compare_window", "get_related_events"]
+
+    async def _generate_final_answer(self) -> dict:
+        prompt = f"""
+Based on the investigation, provide your final conclusion.
+
+Evidence collected: {len(self.state['evidence'])}
+Steps taken: {len(self.state['completed_steps'])}
+
+Summarize:
+1. Root cause
+2. Supporting evidence
+3. Confidence level (0.0 to 1.0)
+"""
+
+        response = await self.llm.generate(prompt)
+
+        return {
+            "root_cause": response,
+            "evidence_ids": [e.evidence_id for e in self.state["evidence"]],
+            "confidence": self.state["confidence"],
+        }
+
+    def _snapshot_state(self) -> dict:
+        return {
+            "step": len(self.state["completed_steps"]),
+            "confidence": self.state["confidence"],
+            "evidence_count": len(self.state["evidence"]),
+            "hypotheses_count": len(self.state["hypotheses"]),
+        }

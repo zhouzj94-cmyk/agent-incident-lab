@@ -1,0 +1,11 @@
+agent:
+  max_steps: 12
+  max_replans: 3
+  max_retries: 2
+  confidence_threshold: 0.75
+  anti_loop_threshold: 2
+
+  context:
+    max_evidence: 20
+    max_hypotheses: 5
+    max_observations: 10
